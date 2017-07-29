@@ -1,76 +1,54 @@
-extern crate websocket;
-extern crate futures;
-extern crate tokio_core;
+extern crate ws;
 
-use std::fmt::Debug;
+use std::rc::Rc;
+use std::cell::Cell;
 
-use websocket::message::{Message, OwnedMessage};
-use websocket::server::InvalidConnection;
-use websocket::async::Server;
+use ws::{listen, Handler, Sender, Result, Message, Handshake, CloseCode, Error};
 
-use tokio_core::reactor::{Handle, Core};
-use futures::{Future, Sink, Stream};
-
-fn main() {
-	let mut core = Core::new().unwrap();
-	let handle = core.handle();
-	// bind to the server
-	let server = Server::bind("127.0.0.1:2794", &handle).unwrap();
-
-	// time to build the server's future
-	// this will be a struct containing everything the server is going to do
-
-	// a stream of incoming connections
-	let f = server.incoming()
-        // we don't wanna save the stream if it drops
-        .map_err(|InvalidConnection { error, .. }| error)
-        .for_each(|(upgrade, addr)| {
-            println!("Got a connection from: {}", addr);
-            // check if it has the protocol we want
-            /*
-            if !upgrade.protocols().iter().any(|s| s == "rust-websocket") {
-                // reject it if it doesn't
-                spawn_future(upgrade.reject(), "Upgrade Rejection", &handle);
-                return Ok(());
-            }
-            */
-
-            // accept the request to be a ws connection if it does
-            let f = upgrade
-                //.use_protocol("rust-websocket")
-                .accept()
-                // send a greeting!
-                //.and_then(|(s, _)| s.send(Message::text("Hello World!").into()))
-                // simple echo server impl
-                .and_then(|(s, _)| {
-                    let (sink, stream) = s.split();
-                    stream
-                    .take_while(|m| Ok(!m.is_close()))
-                    .filter_map(|m| {
-                        //println!("Message from Client: {:?}", m);
-                        match m {
-                            OwnedMessage::Ping(p) => Some(OwnedMessage::Pong(p)),
-                            OwnedMessage::Pong(_) => None,
-                            _ => Some(m),
-                        }
-                    })
-                    .forward(sink)
-                    .and_then(|(_, sink)| {
-                        sink.send(OwnedMessage::Close(None))
-                    })
-                });
-
-            spawn_future(f, "Client Status", &handle);
-            Ok(())
-        });
-
-	core.run(f).unwrap();
+struct Server {
+    out: Sender,
+    count: Rc<Cell<u32>>,
 }
 
-fn spawn_future<F, I, E>(f: F, desc: &'static str, handle: &Handle)
-	where F: Future<Item = I, Error = E> + 'static,
-	      E: Debug
-{
-	handle.spawn(f.map_err(move |e| println!("{}: '{:?}'", desc, e))
-	              .map(move |_| println!("{}: Finished.", desc)));
+impl Handler for Server {
+
+    fn on_open(&mut self, _: Handshake) -> Result<()> {
+        // We have a new connection, so we increment the connection counter
+        Ok(self.count.set(self.count.get() + 1))
+    }
+
+    fn on_message(&mut self, msg: Message) -> Result<()> {
+        // Tell the user the current count
+        println!("The number of live connections is {}", self.count.get());
+
+        // Echo the message back
+        self.out.send(msg)
+    }
+
+    fn on_close(&mut self, code: CloseCode, reason: &str) {
+        match code {
+            CloseCode::Normal => println!("The client is done with the connection."),
+            CloseCode::Away   => println!("The client is leaving the site."),
+            CloseCode::Abnormal => println!(
+                "Closing handshake failed! Unable to obtain closing status from client."),
+            _ => println!("The client encountered an error: {}", reason),
+        }
+
+        // The connection is going down, so we need to decrement the count
+        self.count.set(self.count.get() - 1)
+    }
+
+    fn on_error(&mut self, err: Error) {
+        println!("The server encountered an error: {:?}", err);
+    }
+
+}
+
+fn main() {
+  // Cell gives us interior mutability so we can increment
+  // or decrement the count between handlers.
+  // Rc is a reference-counted box for sharing the count between handlers
+  // since each handler needs to own its contents.
+  let count = Rc::new(Cell::new(0));
+  listen("127.0.0.1:3012", |out| { Server { out: out, count: count.clone() } }).unwrap()
 }
