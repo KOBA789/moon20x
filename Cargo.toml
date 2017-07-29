@@ -1,0 +1,9 @@
+[package]
+name = "moon20x"
+version = "0.1.0"
+authors = ["Hidekazu Kobayashi <kobahide789@gmail.com>"]
+
+[dependencies]
+websocket = "0.20.2"
+futures = "0.1.14"
+tokio-core = "0.1.9"
