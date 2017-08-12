@@ -3,34 +3,40 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time;
+use std::net::SocketAddr;
 
-use redis;
-use redis::Commands;
+use futures::{Future, Stream};
+use futures::unsync::mpsc::Receiver;
+use tokio_core::reactor::Handle;
+use redis_async::client::{paired_connect, pubsub_connect};
+
+use counter::Counter;
 
 pub struct Syncer {
+    addr: SocketAddr,
     name: String,
-    counter: Arc<AtomicUsize>,
-    src: mpsc::Receiver<bool>,
+    counter: Arc<Counter>,
 }
 
 impl Syncer {
-    pub fn new(name: String, counter: Arc<AtomicUsize>, src: mpsc::Receiver<bool>) -> Syncer {
-        Syncer { name, counter, src }
+    pub fn new<A, S>(addr: A, name: S, counter: Arc<Counter>) -> Syncer
+    where
+        A: Into<SocketAddr>,
+        S: ToString,
+    {
+        Syncer {
+            addr: addr.into(),
+            name: name.to_string(),
+            counter,
+        }
     }
 
-    pub fn run(&self) {
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-        let conn = client.get_connection().unwrap();
-        let mut pubsub = client.get_pubsub().unwrap();
-        loop {
-            self.src.recv().unwrap();
-            let local_value = self.counter.swap(0, Ordering::Relaxed);
-            let new_value: i64 = conn.incr(&self.name, local_value).unwrap();
-            redis::cmd("PUBLISH")
-                .arg(&self.name)
-                .arg(new_value)
-                .execute(&conn);
-            thread::sleep(time::Duration::from_millis(10));
-        }
+    pub fn spawn(&self, src: Receiver<bool>, handle: &Handle) {
+        paired_connect(&self.addr, handle).map(|conn| {
+            src.map(|_| {
+                let value = self.counter.reset();
+                conn.send(vec!["INCRBY".to_string(), format!("{}", value)]);
+            });
+        });
     }
 }

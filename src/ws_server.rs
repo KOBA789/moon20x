@@ -1,13 +1,16 @@
 use std::net::ToSocketAddrs;
+use futures::sync::mpsc::{Sender, Receiver};
+use futures::Sink;
 
 use ws;
 use hyper;
 
-use increr::Increr;
-use session_id::{SessionIssuer, UnreliableSessionId, ValidSessionId};
+use increr::{Increr, EventReceiver};
+use session_id::{SessionIssuer, UnreliableSessionId, ValidSessionId, SessionIdBody};
+use acceptor::Acceptor;
 
 struct IncomingServer<'a> {
-    increr: &'a Increr,
+    increr: Increr,
     issuer: &'a SessionIssuer,
     out: ws::Sender,
     session_id: Option<ValidSessionId>,
@@ -60,8 +63,8 @@ impl<'a> ws::Handler for IncomingServer<'a> {
     }
 
     fn on_message(&mut self, _: ws::Message) -> ws::Result<()> {
-        self.increr.incr();
-        //self.out.close_with_reason(ws::CloseCode::Policy, "Log queue overflow")?;
+        println!("incr");
+        self.increr.incr(0, self.session_id.as_ref().unwrap().body());
         Ok(())
     }
 
@@ -77,7 +80,7 @@ impl<'a> ws::Handler for IncomingServer<'a> {
     }
 }
 
-pub fn run_ws_server<A: ToSocketAddrs>(increr: Increr, secret: [u8; 32], addr: A) {
+pub fn run_ws_server<A: ToSocketAddrs>(incr_tx: Sender<EventReceiver>, secret: [u8; 32], addr: A) {
     let issuer = SessionIssuer::new(secret);
     ws::Builder::new()
         .with_settings(ws::Settings {
@@ -85,9 +88,11 @@ pub fn run_ws_server<A: ToSocketAddrs>(increr: Increr, secret: [u8; 32], addr: A
             in_buffer_grow: true,
             ..ws::Settings::default()
         })
-        .build(|out| {
+        .build(move |out| {
+            let (increr, receiver) = Increr::new();
+            incr_tx.clone().start_send(receiver).unwrap();
             IncomingServer {
-                increr: &increr,
+                increr: increr,
                 issuer: &issuer,
                 out,
                 session_id: None,

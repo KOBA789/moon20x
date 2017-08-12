@@ -11,7 +11,16 @@ use session_id::SessionIdBody;
 #[derive(Debug)]
 pub struct DataPoint {
     sid_body: SessionIdBody,
-    timestamp: i64,
+    timestamp: u64, // danger: influxdb accepts 64bit signed only
+}
+
+impl DataPoint {
+    pub fn new(sid: SessionIdBody, timestamp: u64) -> DataPoint {
+        DataPoint {
+            sid_body: sid,
+            timestamp,
+        }
+    }
 }
 
 pub struct WriteCodec {
@@ -40,17 +49,15 @@ impl UdpCodec for WriteCodec {
     }
 }
 
-pub fn connect<S: ToString>(
-    server_addr: SocketAddr,
-    btn_name: S,
-    handle: &Handle,
-) -> UdpFramed<WriteCodec> {
+pub type InfluxWriter = UdpFramed<WriteCodec>;
+
+pub fn connect<A: Into<SocketAddr>, S: ToString>(addr: A, btn_name: S, handle: &Handle) -> InfluxWriter {
     let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let measurement = format!("{}_incr", btn_name.to_string());
     let sock = UdpSocket::bind(&local_addr, &handle).unwrap();
     sock.framed(WriteCodec {
         measurement,
-        server_addr,
+        server_addr: addr.into(),
     })
 }
 
