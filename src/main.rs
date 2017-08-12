@@ -1,3 +1,5 @@
+#![feature(conservative_impl_trait)]
+
 extern crate ws;
 extern crate redis;
 extern crate hyper;
@@ -6,12 +8,19 @@ extern crate crypto;
 extern crate byteorder;
 extern crate time;
 extern crate rand;
+extern crate bytes;
+extern crate futures;
+extern crate tokio_io;
+extern crate tokio_proto;
+extern crate tokio_core;
+extern crate redis_async;
 
 mod session_id;
 mod increr;
 mod syncer;
 mod ws_server;
-//mod acl;
+mod influxdb;
+mod acl;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;

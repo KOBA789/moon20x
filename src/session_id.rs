@@ -7,9 +7,20 @@ use crypto::mac::Mac;
 use crypto::mac::MacResult;
 use byteorder::{ByteOrder, BigEndian};
 use std::io::Write;
+use std::fmt;
+use std::cmp::{Eq, PartialEq};
 use rand::os::OsRng;
 use rand::Rng;
 use time;
+
+fn clone_into_array<A, T>(slice: &[T]) -> A
+    where A: Sized + Default + AsMut<[T]>,
+          T: Clone
+{
+    let mut a = Default::default();
+    <A as AsMut<[T]>>::as_mut(&mut a).clone_from_slice(slice);
+    a
+}
 
 /*
  *
@@ -24,7 +35,6 @@ use time;
  *
  * timestamp is represented in BigEndian
  */
-
 pub struct SessionId([u8; 64]);
 
 impl SessionId {
@@ -45,7 +55,7 @@ impl SessionId {
     }
 
     pub fn body(&self) -> SessionIdBody {
-        SessionIdBody(&self[32..64])
+        SessionIdBody(clone_into_array(&self[32..64]))
     }
 
     fn signature(&self) -> MacResult {
@@ -60,20 +70,36 @@ impl Deref for SessionId {
     }
 }
 
-pub struct SessionIdBody<'a>(&'a [u8]);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionIdBody([u8; 32]);
 
-impl<'a> SessionIdBody<'a> {
+impl SessionIdBody {
     fn digest(&self) -> Sha256 {
         let mut sha256 = Sha256::new();
-        sha256.input(self.0);
+        sha256.input(&self.0);
         sha256
+    }
+
+    pub fn from_hex<T: AsRef<[u8]>>(hex: T) -> Option<SessionIdBody> {
+        Vec::from_hex(hex).ok().and_then(|bytes| {
+            if bytes.len() != 32 {
+                return None;
+            }
+            Some(SessionIdBody(clone_into_array(&bytes[32..64])))
+        })
     }
 }
 
-impl<'a> Deref for SessionIdBody<'a> {
+impl Deref for SessionIdBody {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl fmt::Display for SessionIdBody {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.as_ref().write_hex(f)
     }
 }
 
@@ -138,14 +164,14 @@ impl SessionIssuer {
         let mut body_bytes = [0u8; 32];
         body_bytes[0] = 0x01; // version
         BigEndian::write_u64(&mut body_bytes[8..16], timestamp);
-        (&mut body_bytes[16..32]).write_all(&salt).unwrap();
-        let body = SessionIdBody(&body_bytes);
+        body_bytes[16..32].as_mut().write_all(&salt).unwrap();
+        let body = SessionIdBody(body_bytes);
 
         let digest = body.digest();
         let hash = self.signature(digest);
         let mut bytes = [0u8; 64];
-        (&mut bytes[0..32]).write_all(hash.code()).unwrap();
-        (&mut bytes[32..64]).write_all(&body_bytes).unwrap();
+        bytes[0..32].as_mut().write_all(hash.code()).unwrap();
+        bytes[32..64].as_mut().write_all(&body_bytes).unwrap();
 
         ValidSessionId(SessionId(bytes))
     }
