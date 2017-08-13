@@ -7,7 +7,6 @@ use tokio_core::reactor::{Handle, Timeout};
 
 use counter::Counter;
 use increr::{EventReceiver, Incr};
-use influxdb::{InfluxWriter, DataPoint};
 use syncer::Syncer;
 use acl::{AclStream, Acl};
 
@@ -21,7 +20,7 @@ pub fn spawn<'a>(
     clients_rx: sync::mpsc::Receiver<EventReceiver>,
     acl_stream: AclStream,
     syncer: Syncer,
-    influx: InfluxWriter,
+    //influx: InfluxWriter,
     handle: Handle,
 ) -> impl Future<Item = (), Error = ()> + 'a {
     let handle_for_clients = handle.clone();
@@ -59,20 +58,19 @@ pub fn spawn<'a>(
     merged_incr_events
         .select(reduced_sync_events)
         .select(acl_update_events)
-        .fold((influx, acl), move |(mut influx, acl), event| match event {
+        .fold(acl, move |acl, event| match event {
             Event::Incr((ts, sid)) => {
                 if acl.is_allowed(&sid) {
                     counter.incr();
                 }
-                //influx.start_send(DataPoint::new(sid, ts)).ok();
-                future::ok((influx, acl))
+                future::ok(acl)
             }
             Event::CounterSync => {
                 syncer.sync(&counter);
-                future::ok((influx, acl))
+                future::ok(acl)
             }
             Event::AclUpdate(acl) => {
-                future::ok((influx, acl))
+                future::ok(acl)
             }
         })
         .and_then(|_| Ok(()))

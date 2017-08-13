@@ -1,64 +1,57 @@
 use std::net::SocketAddr;
-use std::io;
 use std::io::Write;
+use std::net;
+use std::sync::mpsc::{sync_channel, SyncSender, TryRecvError};
+use std::thread;
 
-use tokio_core::net::{UdpCodec, UdpSocket, UdpFramed};
-use tokio_core::reactor::Handle;
-use bytes::BufMut;
+use increr::Incr;
 
-use session_id::SessionIdBody;
-
-#[derive(Debug)]
-pub struct DataPoint {
-    sid_body: SessionIdBody,
-    timestamp: u64, // danger: influxdb accepts 64bit signed only
+pub struct WriterThread {
+    addr: SocketAddr,
+    btn_name: String,
 }
 
-impl DataPoint {
-    pub fn new(sid: SessionIdBody, timestamp: u64) -> DataPoint {
-        DataPoint {
-            sid_body: sid,
-            timestamp,
-        }
-    }
-}
+const CHAN_CAP: usize = 100;
 
-pub struct WriteCodec {
-    measurement: String,
-    server_addr: SocketAddr,
-}
-
-impl UdpCodec for WriteCodec {
-    type In = ();
-    type Out = DataPoint;
-
-    fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
-        buf.writer()
-            .write_fmt(format_args!(
-                "{},sid={} event_time={}\n",
-                &self.measurement,
-                msg.sid_body,
-                msg.timestamp
-            ))
-            .ok();
-        self.server_addr
+impl WriterThread {
+    pub fn new<A: Into<SocketAddr>, S: ToString>(addr: A, btn_name: S) -> WriterThread {
+        WriterThread { addr: addr.into(), btn_name: btn_name.to_string() }
     }
 
-    fn decode(&mut self, _: &SocketAddr, _: &[u8]) -> io::Result<Self::In> {
-        Ok(())
+    pub fn run(self) -> SyncSender<Incr> {
+        let (tx, rx) = sync_channel(CHAN_CAP);
+        thread::spawn(move|| {
+            let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let udp = net::UdpSocket::bind(local_addr).unwrap();
+            let measurement = format!("{}_incr", self.btn_name);
+            let mut recv_buf: Vec<Incr> = Vec::with_capacity(CHAN_CAP);
+            let mut buf = Vec::with_capacity(110 * CHAN_CAP);
+            loop {
+                let mut num_mes = 0;
+                recv_buf.clear();
+                recv_buf.push(rx.recv().expect("recv first datapoint"));
+                loop {
+                    match rx.try_recv() {
+                        Ok(incr) => {
+                            recv_buf.push(incr);
+                            num_mes += 1;
+                            if num_mes >= CHAN_CAP {
+                                break;
+                            }
+                        },
+                        Err(TryRecvError::Empty) => break,
+                        Err(e) => panic!(e),
+                    }
+                }
+                buf.clear();
+                for pair in recv_buf.iter() {
+                    buf.write_fmt(format_args!("{},sid={} event_time={}\n", measurement, pair.1.clone(), pair.0.clone())).expect("write datapoints");
+                }
+                udp.send_to(&buf, self.addr).expect("send datapoints");
+            }
+        });
+        tx
     }
-}
-
-pub type InfluxWriter = UdpFramed<WriteCodec>;
-
-pub fn connect<A: Into<SocketAddr>, S: ToString>(addr: A, btn_name: S, handle: &Handle) -> InfluxWriter {
-    let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let measurement = format!("{}_incr", btn_name.to_string());
-    let sock = UdpSocket::bind(&local_addr, &handle).unwrap();
-    sock.framed(WriteCodec {
-        measurement,
-        server_addr: addr.into(),
-    })
 }
 
 #[test]

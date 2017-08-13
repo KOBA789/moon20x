@@ -1,4 +1,5 @@
 use std::net::ToSocketAddrs;
+use std::sync::mpsc::SyncSender;
 use futures::sync::mpsc::Sender;
 use futures::Sink;
 use time;
@@ -6,11 +7,12 @@ use time;
 use ws;
 use hyper;
 
-use increr::{Increr, EventReceiver};
+use increr::{Increr, EventReceiver, Incr};
 use session_id::{SessionIssuer, UnreliableSessionId, ValidSessionId};
 
 struct IncomingServer<'a> {
     increr: Increr,
+    influx: SyncSender<Incr>,
     issuer: &'a SessionIssuer,
     out: ws::Sender,
     session_id: Option<ValidSessionId>,
@@ -63,10 +65,9 @@ impl<'a> ws::Handler for IncomingServer<'a> {
     }
 
     fn on_message(&mut self, _: ws::Message) -> ws::Result<()> {
-        self.increr.incr(
-            time::precise_time_ns(),
-            self.session_id.as_ref().unwrap().body(),
-        );
+        let incr = (time::precise_time_ns(), self.session_id.as_ref().unwrap().body());
+        self.increr.incr(incr.clone());
+        self.influx.send(incr).unwrap();
         Ok(())
     }
 
@@ -82,7 +83,7 @@ impl<'a> ws::Handler for IncomingServer<'a> {
     }
 }
 
-pub fn run_ws_server<A: ToSocketAddrs>(incr_tx: Sender<EventReceiver>, secret: [u8; 32], addr: A) {
+pub fn run_ws_server<A: ToSocketAddrs>(incr_tx: Sender<EventReceiver>, influx: SyncSender<Incr>, secret: [u8; 32], addr: A) {
     let issuer = SessionIssuer::new(secret);
     ws::Builder::new()
         .with_settings(ws::Settings {
@@ -96,6 +97,7 @@ pub fn run_ws_server<A: ToSocketAddrs>(incr_tx: Sender<EventReceiver>, secret: [
             incr_tx.clone().start_send(receiver).unwrap();
             IncomingServer {
                 increr: increr,
+                influx: influx.clone(),
                 issuer: &issuer,
                 out,
                 session_id: None,

@@ -46,15 +46,16 @@ fn main() {
 
     let (clients_tx, clients_rx) = channel::<EventReceiver>(1000);
 
-    let influx = influxdb::connect(influx_addr, "saikoh", &handle);
+    //let influx = influxdb::connect(influx_addr, "saikoh", &handle);
+    let influx_tx = influxdb::WriterThread::new(influx_addr, "saikoh").run();
     let handle2 = core.handle();
     handle.spawn(prepare.and_then(move |(acl_stream, syncer)| {
-        acceptor::spawn(clients_rx, acl_stream, syncer, influx, handle2)
+        acceptor::spawn(clients_rx, acl_stream, syncer, handle2)
     }));
 
     let secret = [0u8; 32]; // FIXME
     thread::spawn(move || {
-        ws_server::run_ws_server(clients_tx, secret, "0.0.0.0:3012");
+        ws_server::run_ws_server(clients_tx, influx_tx, secret, "0.0.0.0:3012");
     });
 
     core.run(::futures::empty::<(), ()>()).unwrap();
