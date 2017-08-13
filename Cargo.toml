@@ -5,7 +5,6 @@ authors = ["Hidekazu Kobayashi <kobahide789@gmail.com>"]
 
 [dependencies]
 ws = "^0.7.3"
-redis = "^0.8.0"
 hyper = "^0.11.2"
 hex = "*"
 rust-crypto = "^0.2"
@@ -18,3 +17,6 @@ tokio-proto = "^0.1.1"
 bytes = "^0.4.4"
 futures = "^0.1.14"
 redis-async = "^0.0.2"
+
+[profile.release]
+debug = true

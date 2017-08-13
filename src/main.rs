@@ -1,7 +1,6 @@
 #![feature(conservative_impl_trait)]
 
 extern crate ws;
-extern crate redis;
 extern crate hyper;
 extern crate hex;
 extern crate crypto;

@@ -31,15 +31,13 @@ pub fn spawn<'a>(
     let (raw_updates, mut counter) = Counter::new();
     let (merged_incr_tx, merged_incr_rx) = channel::<Incr>(100);
 
-    let influx_sink = influx.sink_map_err(|_| ());
-
     handle_outer.spawn(
         clients_rx
             .map(move |recv| {
                 // 各クライアント用に書き込みチャネルを複製
                 let merged_tx = merged_incr_tx.clone();
-                recv.forward(merged_tx.sink_map_err(|_| ()))
-                    .then(|_| Ok(()))
+                recv.forward(merged_tx.sink_map_err(|e| println!("{}", e)))
+                    .and_then(|_| Ok(()))
             })
             .for_each(move |flow| {
                 handle_for_clients.spawn(flow);
@@ -51,8 +49,8 @@ pub fn spawn<'a>(
     let acl = Acl::empty();
 
     let reduced_sync_events = raw_updates
-        .map(move |_| {
-            Timeout::new(Duration::from_millis(10), &handle_for_timer).unwrap()
+        .and_then(move |_| {
+            Timeout::new(Duration::from_millis(100), &handle_for_timer).unwrap().map_err(|_| ())
         })
         .map(|_| Event::CounterSync);
 
@@ -61,20 +59,21 @@ pub fn spawn<'a>(
     merged_incr_events
         .select(reduced_sync_events)
         .select(acl_update_events)
-        .fold((influx_sink, acl), move |(influx, acl), event| match event {
+        .fold((influx, acl), move |(mut influx, acl), event| match event {
             Event::Incr((ts, sid)) => {
                 if acl.is_allowed(&sid) {
                     counter.incr();
                 }
-                influx.send(DataPoint::new(sid, ts)).map(|influx| (influx, acl)).boxed()
+                //influx.start_send(DataPoint::new(sid, ts)).ok();
+                future::ok((influx, acl))
             }
             Event::CounterSync => {
                 syncer.sync(&counter);
-                future::ok((influx, acl)).boxed()
+                future::ok((influx, acl))
             }
             Event::AclUpdate(acl) => {
-                future::ok((influx, acl)).boxed()
+                future::ok((influx, acl))
             }
         })
-        .then(|_| Ok(()))
+        .and_then(|_| Ok(()))
 }
