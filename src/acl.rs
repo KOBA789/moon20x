@@ -1,10 +1,9 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{RwLock, Arc};
 
-use futures::{Future, Stream, BoxFuture};
+use futures::{Future, Stream, Sink};
 use tokio_core::reactor::Handle;
-use redis_async::client::{paired_connect, pubsub_connect};
+use redis_async::client::{PairedConnection, paired_connect, pubsub_connect};
 use redis_async::resp::RespValue;
 
 use session_id::SessionIdBody;
@@ -16,47 +15,31 @@ pub struct Acl {
 }
 
 impl Acl {
-    pub fn new() -> Arc<RwLock<Acl>> {
-        Arc::new(RwLock::new(Acl { blacklist: HashSet::new() }))
+    pub fn empty() -> Acl {
+        Acl { blacklist: HashSet::new() }
     }
-}
 
-pub struct Gatekeeper {
-    acl: Arc<RwLock<Acl>>,
-}
-
-impl Gatekeeper {
     pub fn is_allowed(&self, sid_body: &SessionIdBody) -> bool {
-        self.acl
-            .try_read()
-            .map(|acl| !acl.blacklist.contains(sid_body))
-            .unwrap_or(false)
-    }
-
-    pub fn new(acl: Arc<RwLock<Acl>>) -> Gatekeeper {
-        Gatekeeper { acl }
+        !self.blacklist.contains(sid_body)
     }
 }
 
-pub struct AclSyncer {
-    addr: SocketAddr,
-    acl: Arc<RwLock<Acl>>,
+pub struct AclFetcher {
+    conn: PairedConnection,
 }
 
-impl AclSyncer {
-    fn update(&self, new_sids: Vec<SessionIdBody>) {
-        while let Err(_) = self.acl.try_write().map(|mut acl| {
-            acl.blacklist.clear();
-            for sid in new_sids.iter() {
-                acl.blacklist.insert(sid.clone());
-            }
-        })
-        { /* spin */ }
+impl AclFetcher {
+    pub fn connect<'a>(
+        addr: &SocketAddr,
+        handle: &Handle,
+    ) -> impl Future<Item = AclFetcher, Error = ::redis_async::error::Error> + 'a {
+        paired_connect(addr, handle)
+            .map(|conn| AclFetcher { conn })
     }
 
-    fn unpack_resp(resp: RespValue) -> Vec<SessionIdBody> {
+    fn unpack_resp(resp: RespValue) -> HashSet<SessionIdBody> {
         if let RespValue::Array(raw_sids) = resp {
-            let sids: Vec<_> = raw_sids
+            let sids: HashSet<_> = raw_sids
                 .into_iter()
                 .filter_map(|sid| {
                     if let RespValue::SimpleString(sid) = sid {
@@ -69,37 +52,47 @@ impl AclSyncer {
                 .collect();
             return sids;
         }
-        return vec![];
-    }
-    /*
-    fn sync(self, handle: &Handle) -> BoxFuture<Self, ()> {
-        paired_connect(&self.addr, handle).and_then(move |conn| {
-            conn.send(vec!["SMEMBERS", "blacklist"])
-                .map(AclSyncer::unpack_resp)
-                .map(move |sids| self.update(sids))
-        })
-    }
-*/
-    pub fn spawn(self, handle: &Handle) {
-        let pubsub = pubsub_connect(&self.addr, handle);
-        pubsub
-            .and_then(|pubsub| {
-                //self.sync(handle);
-                pubsub.subscribe("blacklist")
-            })
-            .map(move |blacklist_stream| {
-                blacklist_stream.fold(self, move |me, _| {
-                    paired_connect(&me.addr, handle).and_then(move |conn| {
-                        conn.send(vec!["SMEMBERS", "blacklist"])
-                            .map(AclSyncer::unpack_resp)
-                            .map(move |sids| me.update(sids))
-                    }).map(|_| me).map_err(|_| ())
-                });
-            });
+        return HashSet::new();
     }
 
-    pub fn new<A: Into<SocketAddr>>(addr: A, acl: Arc<RwLock<Acl>>) -> AclSyncer {
-        let addr: SocketAddr = addr.into();
-        AclSyncer { addr, acl }
+    pub fn fetch<'a>(&self) -> impl Future<Item = Acl, Error = ()> + 'a {
+        self.conn
+            .send(vec!["SMEMBERS", "blacklist"])
+            .map(AclFetcher::unpack_resp)
+            .map(|blacklist| Acl { blacklist })
+            .map_err(|_| ())
+    }
+}
+
+pub struct AclStream {
+    blacklist_stream: ::futures::unsync::mpsc::Receiver<()>,
+    fetcher: AclFetcher,
+}
+
+impl AclStream {
+    pub fn connect<'a>(
+        addr: &SocketAddr,
+        handle: Handle,
+    ) -> impl Future<Item = AclStream, Error = ()> + 'a {
+        let fetcher_fut = AclFetcher::connect(&addr, &handle);
+        pubsub_connect(addr, &handle)
+            .and_then(move |pubsub| pubsub.subscribe("blacklist").join(fetcher_fut))
+            .map(|(blacklist_stream, fetcher)| (blacklist_stream.map(|_| ()), fetcher))
+            .map(move |(blacklist_stream, fetcher)| {
+                let (tx, rx) = ::futures::unsync::mpsc::channel::<()>(10);
+                handle.spawn(blacklist_stream.forward(tx.sink_map_err(|_| ())).then(|_| Ok(())));
+                AclStream {
+                    blacklist_stream: rx,
+                    fetcher,
+                }
+            })
+            .map_err(|_| ())
+    }
+
+    pub fn stream<'a>(self) -> impl Stream<Item = Acl, Error = ()> + 'a {
+        let fetcher = self.fetcher;
+        self.blacklist_stream.and_then(move |_| {
+            fetcher.fetch()
+        })
     }
 }

@@ -8,14 +8,14 @@ use crypto::mac::MacResult;
 use byteorder::{ByteOrder, BigEndian};
 use std::io::Write;
 use std::fmt;
-use std::cmp::{Eq, PartialEq};
 use rand::os::OsRng;
 use rand::Rng;
 use time;
 
 fn clone_into_array<A, T>(slice: &[T]) -> A
-    where A: Sized + Default + AsMut<[T]>,
-          T: Clone
+where
+    A: Sized + Default + AsMut<[T]>,
+    T: Clone,
 {
     let mut a = Default::default();
     <A as AsMut<[T]>>::as_mut(&mut a).clone_from_slice(slice);

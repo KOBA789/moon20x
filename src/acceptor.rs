@@ -1,92 +1,80 @@
-use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
-use std::ops::Deref;
+use std::time::Duration;
 
 use futures::{Sink, Stream, Future, future};
-use futures::unsync::mpsc::{channel, Sender, Receiver};
+use futures::unsync::mpsc::channel;
 use futures::sync;
-use tokio_core::reactor::Handle;
+use tokio_core::reactor::{Handle, Timeout};
 
 use counter::Counter;
-use increr::EventReceiver;
+use increr::{EventReceiver, Incr};
 use influxdb::{InfluxWriter, DataPoint};
-use acl::Gatekeeper;
-use session_id::SessionIdBody;
+use syncer::Syncer;
+use acl::{AclStream, Acl};
 
-pub struct Acceptor {
-    pub counter: Arc<Counter>,
-    gatekeeper: Gatekeeper,
-    influx: InfluxWriter,
+enum Event {
+    CounterSync,
+    AclUpdate(Acl),
+    Incr(Incr),
 }
 
-impl Acceptor {
-    pub fn new(influx: InfluxWriter, gatekeeper: Gatekeeper) -> Acceptor {
-        let acceptor = Acceptor {
-            counter: Arc::new(Counter::new()),
-            gatekeeper,
-            influx,
-        };
+pub fn spawn<'a>(
+    clients_rx: sync::mpsc::Receiver<EventReceiver>,
+    acl_stream: AclStream,
+    syncer: Syncer,
+    influx: InfluxWriter,
+    handle: Handle,
+) -> impl Future<Item = (), Error = ()> + 'a {
+    let handle_for_clients = handle.clone();
+    let handle_outer = handle.clone();
+    let handle_for_timer = handle.clone();
 
-        acceptor
-    }
+    let (raw_updates, mut counter) = Counter::new();
+    let (merged_incr_tx, merged_incr_rx) = channel::<Incr>(100);
 
-    pub fn spawn(self, handle: &Handle, handle2: Handle) -> (Arc<Counter>, Receiver<bool>, sync::mpsc::Sender<EventReceiver>) {
-        let (counter_tx, counter_rx) = channel(1);
-        let (influx_tx, influx_rx) = channel::<DataPoint>(100);
-        let (recv_tx, recv_rx) = sync::mpsc::channel::<EventReceiver>(100);
+    let influx_sink = influx.sink_map_err(|_| ());
 
-        let flow = influx_rx.fold(self.influx, |influx, dp| {
-            influx.send(dp).map_err(|_| ())
-        }).and_then(|_| Ok(()));
-        handle.spawn(flow);
-
-        let gk = Arc::new(self.gatekeeper);
-        let counter = self.counter.clone();
-        let flow = recv_rx.fold(handle2, move |handle, recv| {
-            let counter = counter.clone();
-            let counter_tx = counter_tx.clone();
-            let gk = gk.clone();
-            let flow = recv.filter_map(move |(timestamp, sid)| {
-                if gk.is_allowed(&sid) {
-                    Some(DataPoint::new(sid, timestamp))
-                } else {
-                    None
-                }
-            }).fold(influx_tx.clone(), move |influx, dp| {
-                counter.clone().incr();
-                counter_tx.clone().start_send(true);
-                influx.send(dp).map_err(|_| ())
-            }).and_then(|_| Ok(()));
-            handle.spawn(flow);
-            future::ok::<Handle, ()>(handle)
-        });
-        handle.spawn(flow.and_then(|_| Ok(())));
-
-        (self.counter.clone(), counter_rx, recv_tx)
-    }
-
-    /*
-    pub fn increr(&self) -> Increr {
-
-        //let counter_tx = self.counter_tx.clone();
-        let gk = self.gatekeeper.clone();
-        let influx = self.influx_tx.clone();
-        let (tx, rx) = channel::<(u64, SessionIdBody)>(100);
-        let counter = self.counter.clone();
-        let flow = rx.filter_map(move |(timestamp, sid)| {
-                if gk.is_allowed(&sid) {
-                    Some(DataPoint::new(sid, timestamp))
-                } else {
-                    None
-                }
+    handle_outer.spawn(
+        clients_rx
+            .map(move |recv| {
+                // 各クライアント用に書き込みチャネルを複製
+                let merged_tx = merged_incr_tx.clone();
+                recv.forward(merged_tx.sink_map_err(|_| ()))
+                    .then(|_| Ok(()))
             })
-            .fold(influx, move |influx, dp| {
-                counter.incr();
-                //counter_tx.start_send(true);
-                influx.send(dp).map_err(|_| ())
-            });
-        self.handle.spawn(flow.and_then(|_| Ok(())));
-        Increr::new(tx)
-    }
-    */
+            .for_each(move |flow| {
+                handle_for_clients.spawn(flow);
+                Ok(())
+            }),
+    );
+
+    let acl_update_events = acl_stream.stream().map(Event::AclUpdate);
+    let acl = Acl::empty();
+
+    let reduced_sync_events = raw_updates
+        .map(move |_| {
+            Timeout::new(Duration::from_millis(10), &handle_for_timer).unwrap()
+        })
+        .map(|_| Event::CounterSync);
+
+    let merged_incr_events = merged_incr_rx.map(Event::Incr);
+
+    merged_incr_events
+        .select(reduced_sync_events)
+        .select(acl_update_events)
+        .fold((influx_sink, acl), move |(influx, acl), event| match event {
+            Event::Incr((ts, sid)) => {
+                if acl.is_allowed(&sid) {
+                    counter.incr();
+                }
+                influx.send(DataPoint::new(sid, ts)).map(|influx| (influx, acl)).boxed()
+            }
+            Event::CounterSync => {
+                syncer.sync(&counter);
+                future::ok((influx, acl)).boxed()
+            }
+            Event::AclUpdate(acl) => {
+                future::ok((influx, acl)).boxed()
+            }
+        })
+        .then(|_| Ok(()))
 }

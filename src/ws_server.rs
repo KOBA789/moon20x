@@ -1,13 +1,13 @@
 use std::net::ToSocketAddrs;
-use futures::sync::mpsc::{Sender, Receiver};
+use futures::sync::mpsc::Sender;
 use futures::Sink;
+use time;
 
 use ws;
 use hyper;
 
 use increr::{Increr, EventReceiver};
-use session_id::{SessionIssuer, UnreliableSessionId, ValidSessionId, SessionIdBody};
-use acceptor::Acceptor;
+use session_id::{SessionIssuer, UnreliableSessionId, ValidSessionId};
 
 struct IncomingServer<'a> {
     increr: Increr,
@@ -63,8 +63,10 @@ impl<'a> ws::Handler for IncomingServer<'a> {
     }
 
     fn on_message(&mut self, _: ws::Message) -> ws::Result<()> {
-        println!("incr");
-        self.increr.incr(0, self.session_id.as_ref().unwrap().body());
+        self.increr.incr(
+            time::precise_time_ns(),
+            self.session_id.as_ref().unwrap().body(),
+        );
         Ok(())
     }
 
@@ -90,6 +92,7 @@ pub fn run_ws_server<A: ToSocketAddrs>(incr_tx: Sender<EventReceiver>, secret: [
         })
         .build(move |out| {
             let (increr, receiver) = Increr::new();
+            // 一気に接続が来るとここの unwrap で死ぬ
             incr_tx.clone().start_send(receiver).unwrap();
             IncomingServer {
                 increr: increr,

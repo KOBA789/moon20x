@@ -3,8 +3,8 @@ use futures::Sink;
 
 use session_id::SessionIdBody;
 
-pub type Event = (u64, SessionIdBody);
-pub type EventReceiver = Receiver<Event>;
+pub type Incr = (u64, SessionIdBody);
+pub type EventReceiver = Receiver<Incr>;
 
 pub struct Increr {
     sink: Sender<(u64, SessionIdBody)>,
@@ -12,7 +12,7 @@ pub struct Increr {
 
 impl Increr {
     pub fn new() -> (Increr, EventReceiver) {
-        let (sink, src) = channel(100);
+        let (sink, src) = channel(10000);
         (Increr { sink }, src)
     }
 

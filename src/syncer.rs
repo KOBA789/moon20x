@@ -1,42 +1,37 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
-use std::time;
 use std::net::SocketAddr;
 
-use futures::{Future, Stream};
-use futures::unsync::mpsc::Receiver;
+use futures::Future;
 use tokio_core::reactor::Handle;
-use redis_async::client::{paired_connect, pubsub_connect};
+use redis_async::client::{paired_connect, PairedConnection};
 
 use counter::Counter;
 
 pub struct Syncer {
-    addr: SocketAddr,
     name: String,
-    counter: Arc<Counter>,
+    conn: PairedConnection,
 }
 
 impl Syncer {
-    pub fn new<A, S>(addr: A, name: S, counter: Arc<Counter>) -> Syncer
+    pub fn connect<'a, S>(
+        addr: &SocketAddr,
+        name: S,
+        handle: &Handle,
+    ) -> impl Future<Item = Syncer, Error = ()> + 'a
     where
-        A: Into<SocketAddr>,
         S: ToString,
     {
-        Syncer {
-            addr: addr.into(),
-            name: name.to_string(),
-            counter,
-        }
+        let name = name.to_string();
+        paired_connect(addr, handle).map_err(|_| ()).map(|conn| {
+            Syncer { conn, name: name }
+        })
     }
 
-    pub fn spawn(&self, src: Receiver<bool>, handle: &Handle) {
-        paired_connect(&self.addr, handle).map(|conn| {
-            src.map(|_| {
-                let value = self.counter.reset();
-                conn.send(vec!["INCRBY".to_string(), format!("{}", value)]);
-            });
-        });
+    pub fn sync(&self, counter: &Counter) {
+        let value = counter.reset();
+        self.conn.send(vec![
+            "INCRBY".to_string(),
+            self.name.clone(),
+            format!("{}", value),
+        ]);
     }
 }
