@@ -1,4 +1,5 @@
 #![feature(conservative_impl_trait)]
+#![feature(lookup_host)]
 
 extern crate ws;
 extern crate hyper;
@@ -23,8 +24,10 @@ mod influxdb;
 mod acl;
 mod acceptor;
 
+use std::env;
 use std::thread;
-use std::net::SocketAddr;
+use std::str::FromStr;
+use std::net::{SocketAddr,lookup_host};
 use futures::Future;
 use futures::sync::mpsc::channel;
 use tokio_core::reactor::Core;
@@ -34,7 +37,13 @@ use increr::EventReceiver;
 use acl::AclStream;
 
 fn main() {
-    let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
+    let redis_host_str = env::var("REDIS_HOST").unwrap();
+    let redis_port_str = env::var("REDIS_PORT").unwrap();
+    let redis_port = u16::from_str(&redis_port_str).unwrap();
+
+    let mut redis_addr = lookup_host(&redis_host_str).unwrap().next().unwrap();
+    redis_addr.set_port(redis_port);
+
     let influx_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
     let mut core = Core::new().unwrap();
