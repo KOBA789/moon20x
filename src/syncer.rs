@@ -33,5 +33,10 @@ impl Syncer {
             self.name.clone(),
             format!("{}", value),
         ]);
+        self.conn.send(vec![
+            "PUBLISH".to_string(),
+            "counter_updates".to_string(),
+            self.name.clone()
+        ]);
     }
 }
