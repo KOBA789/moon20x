@@ -23,6 +23,19 @@ where
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SessionId([u8; 16]);
 
+impl SessionId {
+    pub fn from_hex<T: AsRef<[u8]>>(hex: T) -> Option<SessionId> {
+        Vec::from_hex(hex).ok().and_then(|vec| {
+            if vec.len() != 16 {
+                return None;
+            }
+            let mut arr = [0u8; 16];
+            (&mut arr[..]).write_all(vec.as_slice()).unwrap();
+            Some(SessionId(arr))
+        })
+    }
+}
+
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.0.as_ref().write_hex(f)

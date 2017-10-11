@@ -1,21 +1,38 @@
-use std::net::ToSocketAddrs;
 use futures::{Sink, AsyncSink};
-use futures::sync::mpsc::{Sender, Receiver};
 use time;
 
 use ws;
 use hyper;
 
 //use increr::{Increr, EventReceiver, Incr};
-use session_data::{SessionIssuer, SessionData, SignedSessionData, SessionId};
+use session_data::{SessionIssuer, SessionData, SignedSessionData};
 use events;
 
-struct IncomingServer<'a> {
+pub struct ServerFactory<'a> {
+    client_tx: events::ClientChanTx,
+    issuer: &'a SessionIssuer,
+}
+impl<'a> ws::Factory for ServerFactory<'a> {
+    type Handler = IncomingServer<'a>;
+    fn connection_made(&mut self, out: ws::Sender) -> Self::Handler {
+        IncomingServer {
+            client_tx: self.client_tx.clone(),
+            event_chan: None,
+            issuer: &self.issuer,
+            out,
+            session_data: None,
+            last_timestamp: 0,
+        }
+    }
+}
+
+pub struct IncomingServer<'a> {
     client_tx: events::ClientChanTx,
     event_chan: Option<events::EventChanRouter>,
     issuer: &'a SessionIssuer,
     out: ws::Sender,
     session_data: Option<SessionData>,
+    last_timestamp: u64,
 }
 
 impl<'a> IncomingServer<'a> {
@@ -88,10 +105,17 @@ impl<'a> ws::Handler for IncomingServer<'a> {
             return Ok(());
         }
         let kind_idx = data[0];
-        let timestamp = time::precise_time_ns();
+        let mut timestamp = time::precise_time_ns();
+        if timestamp == self.last_timestamp {
+            timestamp += 1;
+        }
+        self.last_timestamp = timestamp;
         let session_id = self.session_data.as_ref().unwrap().id();
         let incr = (timestamp, session_id);
-        match self.event_chan.as_mut().unwrap().send(kind_idx as usize, incr) {
+        match self.event_chan.as_mut().unwrap().send(
+            kind_idx as usize,
+            incr,
+        ) {
             Ok(()) => Ok(()),
             Err(events::EventChanError::NoCapacity) => Err(ws::Error::new(
                 ws::ErrorKind::Capacity,
@@ -117,8 +141,14 @@ impl<'a> ws::Handler for IncomingServer<'a> {
     }
 }
 
-pub fn run_ws_server<A: ToSocketAddrs>(client_tx: events::ClientChanTx, secret: [u8; 32], addr: A) {
-    let issuer = SessionIssuer::new(secret);
+pub fn build_ws_server<'a>(
+    client_tx: events::ClientChanTx,
+    issuer: &'a SessionIssuer,
+) -> ws::WebSocket<ServerFactory<'a>> {
+    let factory = ServerFactory {
+        client_tx,
+        issuer: issuer,
+    };
     ws::Builder::new()
         .with_settings(ws::Settings {
             max_connections: 10000,
@@ -126,16 +156,6 @@ pub fn run_ws_server<A: ToSocketAddrs>(client_tx: events::ClientChanTx, secret: 
             in_buffer_grow: true,
             ..ws::Settings::default()
         })
-        .build(move |out| {
-            IncomingServer {
-                client_tx: client_tx.clone(),
-                event_chan: None,
-                issuer: &issuer,
-                out,
-                session_data: None,
-            }
-        })
+        .build(factory)
         .unwrap()
-        .listen(addr)
-        .unwrap();
 }

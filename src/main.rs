@@ -13,7 +13,7 @@ extern crate futures_cpupool;
 extern crate tokio_io;
 extern crate tokio_proto;
 extern crate tokio_core;
-//extern crate tokio_timer;
+extern crate tokio_timer;
 extern crate redis_async;
 extern crate url;
 extern crate regex;
@@ -24,59 +24,96 @@ mod session_data;
 mod ws_server;
 mod events;
 mod config;
-mod syncer;
+mod updater;
+mod acl;
+mod influxdb;
 
+use std::thread;
 use config::Config;
 use futures::{Future, Stream, Sink, future};
-use futures::future::Executor;
-use futures::sync::mpsc::{self, Sender, Receiver};
-use futures_cpupool::CpuPool;
+use futures::sync::mpsc;
 use events::Handler;
-use std::sync::Arc;
-//use redis_url::RedisUrl;
-//use std::net::ToSocketAddrs;
+
+fn create_button<'a>(
+    counter: &'a events::Counter,
+    influx_writer: influxdb::IndexedWriter,
+) -> (events::MergedEventChanTx, acl::AclTx, impl Future<Item = (), Error = ()> + 'a) {
+    let (acl_tx, acl_rx) = acl::create_acl_channel();
+    let (tx, rx) = events::create_merged_event_channel();
+    let handler = Handler::new(counter, influx_writer);
+    (tx, acl_tx, handler.run(rx, acl_rx))
+}
+
+// 0: saikoh
+// 1: emoi
+// 2: itf
+// 3: wtc
+
+/*
+|count| {
+                    let mut buf = Vec::with_capacity(9);
+                    buf[0] = idx;
+                    buf[1..].as_mut().write_u64::<byteorder::BE>(count as u64).unwrap();
+                    sender.send(buf).expect("send count");
+                }
+*/
 
 fn main() {
     let config = Config::new();
 
-    let mut core = tokio_core::reactor::Core::new().unwrap();
-    let pool = CpuPool::new(4);
+    let influx_writer = influxdb::WriterThread::new(config.influxdb()).run();
 
-    //let (update_tx, update_rx) = mpsc::channel(100);
     let (client_tx, client_rx) = mpsc::channel(100);
 
-    let handler_hd = core.handle();
-    let acceptor_hd = core.handle();
-    let handlers = syncer::Syncer::connect(config.redis(), &core.handle()).and_then(|syncer| {
-        let syncer = Arc::new(syncer);
-        let handler0 = Handler::new("saikoh", syncer.clone());
-        let handler1 = Handler::new("emoi", syncer.clone());
-        let handler2 = Handler::new("itf", syncer.clone());
-        let handler3 = Handler::new("wtc", syncer.clone());
-
-        let (tx0, rx0) = events::create_merged_event_channel();
-        let (tx1, rx1) = events::create_merged_event_channel();
-        let (tx2, rx2) = events::create_merged_event_channel();
-        let (tx3, rx3) = events::create_merged_event_channel();
-
-        let acceptor = events::Acceptor::new(&mut vec![tx0, tx1, tx2, tx3]).run(acceptor_hd, client_rx);
-
-        future::join_all(vec![
-            handler0.run(rx0, &handler_hd.clone()),
-            handler1.run(rx1, &handler_hd.clone()),
-            handler2.run(rx2, &handler_hd.clone()),
-            handler3.run(rx3, &handler_hd.clone()),
-        ]).join(acceptor).map(|_| ())
-    });
-
     let listen_addr = config.listen();
-    let ws_serve = pool.spawn_fn(move || {
-        ws_server::run_ws_server(client_tx, [0u8; 32], listen_addr);
-        panic!("Websocket Server is down");
-        Ok::<(), ()>(())
+    let issuer = session_data::SessionIssuer::new([0u8; 32]);
+    let app = ws_server::build_ws_server(client_tx, &issuer);
+    let _sender = app.broadcaster();
+    thread::spawn(move || {
+        let mut core = tokio_core::reactor::Core::new().unwrap();
+
+        let updater_fut = updater::Updater::connect(config.redis(), &core.handle());
+        let acl_stream_fut = acl::AclStream::connect(config.redis(), core.handle());
+
+        let preparation = updater_fut.join(acl_stream_fut);
+
+        let counters: Vec<_> = (0u8..4)
+            .map(|idx| {
+                let counter = events::Counter::new();
+                (format!("{}", idx), counter)
+            })
+            .collect();
+
+        let hd = core.handle();
+        let handlers = preparation.and_then(|(updater, acl_stream)| {
+            let mut txs = vec![];
+            let mut handler_futs = vec![];
+            let mut acl_txs = vec![];
+
+            for (idx, &(_, ref counter)) in counters.iter().enumerate() {
+                let indexed = influxdb::IndexedWriter::new(idx as u8, influx_writer.clone());
+                let (tx, acl_tx, fut) = create_button(counter, indexed);
+                txs.push(tx);
+                handler_futs.push(fut);
+                acl_txs.push(acl_tx);
+            }
+
+            hd.clone().spawn(acl_stream.stream().for_each(move |acl| {
+                for acl_tx in acl_txs.iter_mut() {
+                    acl_tx.start_send(acl.clone()).ok();
+                }
+                Ok(())
+            }));
+
+            let acceptor = events::Acceptor::new(&mut txs).run(hd, client_rx);
+            future::join_all(handler_futs)
+                .join(acceptor)
+                .join(updater.start(&counters))
+                .map(|_| ())
+        });
+
+        core.run(handlers).unwrap();
+        panic!("counter thread exited");
     });
-
-    let app = ws_serve.join(handlers);
-
-    core.run(app).unwrap();
+    app.listen(listen_addr).unwrap();
 }

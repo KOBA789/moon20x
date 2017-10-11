@@ -1,14 +1,13 @@
-use std::time;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use futures::sync::mpsc;
 use futures::unsync::mpsc as unsync_mpsc;
-use futures::{Future, Stream, Sink, AsyncSink};
-use tokio_core::reactor::{Handle, Interval};
+use futures::{Future, Stream, Sink};
+use tokio_core::reactor::Handle;
 use arrayvec::ArrayVec;
 
-use syncer::Syncer;
 use session_data::SessionId;
+use acl;
+use influxdb;
 
 const NUM_BUTTON: usize = 4;
 
@@ -50,69 +49,86 @@ impl EventChanRouter {
         if kind_idx >= self.0.len() {
             return Err(EventChanError::NotRouted);
         }
-        let mut chan = &mut self.0[kind_idx];
-        match chan.start_send(event) {
-            Ok(AsyncSink::Ready) => Ok(()),
-            Ok(AsyncSink::NotReady(_)) => Err(EventChanError::NoCapacity),
-            Err(_) => Err(EventChanError::Internal),
+        let chan = &mut self.0[kind_idx];
+        match chan.try_send(event) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if err.is_full() {
+                    Err(EventChanError::NoCapacity)
+                } else {
+                    Err(EventChanError::Internal)
+                }
+            }
         }
     }
 }
 
-pub struct Counter(AtomicUsize);
+pub struct Counter {
+    diff: AtomicUsize,
+    remote: AtomicUsize,
+}
 impl Counter {
     pub fn incr(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.diff.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn reset(&self) -> usize {
-        self.0.swap(0, Ordering::Relaxed)
+        self.diff.swap(0, Ordering::Relaxed)
     }
 
-    pub fn new(init: usize) -> Counter {
-        Counter(AtomicUsize::new(init))
+    pub fn swap_remote(&self, new: usize) -> usize {
+        let old = self.remote.swap(new, Ordering::Relaxed);
+        if new != old {
+
+        }
+        old
+    }
+
+    pub fn count(&self) -> usize {
+        self.remote.load(Ordering::Relaxed)
+    }
+
+    pub fn new() -> Counter {
+        Counter {
+            diff: AtomicUsize::new(0),
+            remote: AtomicUsize::new(0),
+        }
     }
 }
 
-impl Default for Counter {
-    fn default() -> Counter {
-        Self::new(0)
-    }
+pub struct Handler<'a> {
+    counter: &'a Counter,
+    influx_writer: influxdb::IndexedWriter,
 }
-
-pub struct Handler {
-    name: String,
-    counter: Counter,
-    syncer: Arc<Syncer>,
-}
-impl Handler {
-    pub fn new(name: &str, syncer: Arc<Syncer>) -> Self {
+impl<'a> Handler<'a> {
+    pub fn new(counter: &'a Counter, influx_writer: influxdb::IndexedWriter) -> Self {
         Handler {
-            name: name.into(),
-            counter: Counter::default(),
-            syncer,
+            counter,
+            influx_writer,
         }
     }
 
-    pub fn run(self, merged_events: MergedEventChanRx, handle: &Handle) -> impl Future<Item = (), Error = ()> {
+    pub fn run(self, merged_events: MergedEventChanRx, acl_rx: acl::AclRx) -> impl Future<Item = (), Error = ()> {
         enum Input {
             Incr(Incr),
-            Sync,
+            Acl(acl::Acl),
         };
-        let ticks = Interval::new(time::Duration::from_millis(100), handle).unwrap();
-        ticks.map_err(|_| ())
-            .map(|_| Input::Sync)
-            .select(merged_events.map(|e| Input::Incr(e)))
-            .fold(self, move |me, event| {
+        let mut acl = acl::Acl::empty();
+        merged_events.map(Input::Incr)
+            .select(acl_rx.map(Input::Acl))
+            .for_each(move |event| {
                 match event {
-                    Input::Incr(event) => {
-                        me.counter.incr()
+                    Input::Incr(incr) => {
+                        if acl.is_allowed(&incr.1) {
+                            self.counter.incr();
+                        }
+                        self.influx_writer.send(incr);
                     },
-                    Input::Sync => {
-                        me.syncer.sync(&me.counter, &me.name);
+                    Input::Acl(new_acl) => {
+                        acl = new_acl;
                     }
                 };
-                Ok::<_, ()>(me)
+                Ok(())
             }).map(|_| ())
     }
 }
